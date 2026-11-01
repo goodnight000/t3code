@@ -366,6 +366,7 @@ export interface AcpAdapterV2Flavor {
     event: AcpSessionRuntime.AcpSessionRuntimeEvent,
   ) => Effect.Effect<void>;
   readonly subagentsIdleOnTurnCompletion?: boolean;
+  /** Unset follows the session's advertised `compact` command. */
   readonly supportsCompaction?: boolean;
   readonly runtimeHarness?: string;
   readonly registerExtensions?: (
@@ -1690,6 +1691,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const promptInstructionStates = yield* Ref.make(new Map<string, T3AcpInstructionState>());
         // Unique markers keep delayed prompt completions from clearing later compactions.
         const compactionMarkers = yield* Ref.make(new Map<string, symbol>());
+        const advertisedCommandsBySessionId = yield* Ref.make(
+          new Map<string, ReadonlySet<string>>(),
+        );
+        // Undefined until the session lists its commands, which agents send after session/new.
+        const sessionOffersCompaction = (sessionId: string) =>
+          flavor.supportsCompaction === true
+            ? Effect.succeed(true)
+            : Ref.get(advertisedCommandsBySessionId).pipe(
+                Effect.map((current) => current.get(sessionId)?.has("compact")),
+              );
         const runtimeRestartRequired = yield* Ref.make(false);
         const runtimeTeardownState = yield* Ref.make<AcpRuntimeTeardownState>({ _tag: "Idle" });
         const runtimeCallbackGeneration = yield* Ref.make(0);
@@ -5927,6 +5938,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       clientTerminals.readOutputSnapshot,
                     );
               if (notification.update.sessionUpdate === "available_commands_update") {
+                const names = new Set(
+                  notification.update.availableCommands.map((command) => command.name),
+                );
+                yield* Ref.update(advertisedCommandsBySessionId, (current) =>
+                  new Map(current).set(notification.sessionId, names),
+                );
                 yield* (
                   flavor.onAvailableCommandsUpdate?.(notification.update.availableCommands) ??
                     Effect.void
@@ -7190,7 +7207,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
           const now = yield* DateTime.now;
           if (
-            flavor.supportsCompaction === true &&
+            (yield* sessionOffersCompaction(context.nativeThreadId)) === true &&
             context.input.message.text.trim() === "/compact" &&
             context.input.message.attachments.length === 0 &&
             settledStatus === "completed"
@@ -8165,15 +8182,32 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ),
           ),
           startTurn,
-          ...(flavor.supportsCompaction === true
-            ? {
-                compactThread: (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
-                  startTurn({
+          ...(flavor.supportsCompaction === false
+            ? {}
+            : {
+                compactThread: Effect.fn("AcpAdapterV2.compactThread")(function* (
+                  turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+                ) {
+                  const sessionId = turnInput.providerThread.nativeThreadRef?.nativeId;
+                  const offered =
+                    sessionId === undefined || sessionId === null
+                      ? undefined
+                      : yield* sessionOffersCompaction(sessionId);
+                  if (offered === false) {
+                    return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
+                      driver,
+                      threadId: turnInput.threadId,
+                      providerThreadId: turnInput.providerThread.id,
+                      runId: turnInput.runId,
+                      cause: "This agent does not offer a /compact command.",
+                    });
+                  }
+                  return yield* startTurn({
                     ...turnInput,
                     message: { ...turnInput.message, text: "/compact" },
-                  }),
-              }
-            : {}),
+                  });
+                }),
+              }),
           steerTurn: (turnInput) =>
             Effect.fail(
               new ProviderAdapter.ProviderAdapterSteerRunUnsupportedError({

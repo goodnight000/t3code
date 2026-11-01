@@ -2222,6 +2222,117 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
+  it.effect("compacts through an advertised /compact command", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+      const instanceId = ProviderInstanceId.make("acp-test-advertised-compact");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            protocolEvents,
+            wrapRuntime: (runtime) => ({
+              ...runtime,
+              handleSessionUpdate: (handler) =>
+                Effect.sync(() => {
+                  sessionUpdateHandler = handler;
+                }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+            }),
+          }),
+        },
+        selfInvocation,
+      });
+      const threadId = ThreadId.make("thread-acp-advertised-compact");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-advertised-compact"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      assert.isDefined(sessionUpdateHandler);
+      assert.isDefined(runtime.compactThread);
+      const now = yield* DateTime.now;
+      const sessionId = providerThread.nativeThreadRef?.nativeId;
+      if (!sessionId) return yield* Effect.die("ACP provider thread must name its session");
+      const advertise = (names: ReadonlyArray<string>) =>
+        sessionUpdateHandler!({
+          sessionId,
+          update: {
+            sessionUpdate: "available_commands_update",
+            availableCommands: names.map((name) => ({ name, description: name })),
+          },
+        });
+
+      yield* advertise(["context"]);
+      const refused = yield* runtime.compactThread!(
+        makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal: 1 }),
+      ).pipe(Effect.flip);
+      assert.equal(refused._tag, "ProviderAdapterTurnStartError");
+
+      yield* advertise(["compact", "context"]);
+      yield* runtime.compactThread!(
+        makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now,
+          ordinal: 2,
+          messageText: "ignored by compactThread",
+        }),
+      );
+      let compacted = false;
+      let status: string | null = null;
+      while (status === null) {
+        const event = yield* Queue.take(events);
+        if (event.type === "turn_item.updated" && event.turnItem.type === "compaction") {
+          compacted = true;
+        }
+        if (event.type === "turn.terminal") status = event.status;
+      }
+      assert.equal(status, "completed");
+      assert.isTrue(compacted);
+      while (true) {
+        const event = yield* Queue.take(protocolEvents);
+        if (event.direction === "outgoing" && rawProtocolMethod(event) === "session/prompt") {
+          assert.deepInclude(rawProtocolPromptTextBlocks(event), {
+            type: "text",
+            text: "/compact",
+          });
+          break;
+        }
+      }
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.effect("persists a bounded subset of streamed root and child tool updates", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
